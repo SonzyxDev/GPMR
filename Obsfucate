@@ -1,0 +1,433 @@
+-- RMPG Roblox RawLink Obfuscator (UI only)
+-- Paste into executor (or LocalScript in PlayerGui). Tries multiple HTTP methods for fetching raw links.
+-- Produces a runnable obfuscated Lua wrapper that decodes and executes the original script.
+
+-- Services
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+-- Parent to PlayerGui if available (safer than CoreGui on some environments)
+local parentGui = (LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")) or game:GetService("CoreGui")
+
+-- Helper: try multiple HTTP functions (syn.request, http_request, request, HttpService:GetAsync, etc.)
+local function tryFetch(url)
+	-- normalize
+	if not url then return nil, "No URL" end
+	-- prefer https/http prefix
+	if not url:match("^https?://") then
+		return nil, "URL must start with http:// or https://"
+	end
+
+	-- try syn.request
+	local ok, res = pcall(function()
+		if syn and syn.request then
+			return syn.request({ Url = url, Method = "GET" })
+		end
+	end)
+	if ok and type(res) == "table" and res.Body then
+		return tostring(res.Body), nil
+	end
+
+	-- try http_request (old)
+	ok, res = pcall(function()
+		if http_request then
+			return http_request({ Url = url, Method = "GET" })
+		end
+	end)
+	if ok and type(res) == "table" and res.Body then
+		return tostring(res.Body), nil
+	end
+
+	-- try request
+	ok, res = pcall(function()
+		if request then
+			return request({ Url = url, Method = "GET" })
+		end
+	end)
+	if ok and type(res) == "table" and res.Body then
+		return tostring(res.Body), nil
+	end
+
+	-- try http.get (some exploit environments)
+	ok, res = pcall(function()
+		if http and http.get then
+			return http.get(url)
+		end
+	end)
+	if ok and type(res) == "table" and res.Body then
+		return tostring(res.Body), nil
+	end
+
+	-- try HttpService:GetAsync (requires that HTTP is enabled for Roblox place)
+	ok, res = pcall(function()
+		return HttpService:GetAsync(url)
+	end)
+	if ok and type(res) == "string" then
+		return res, nil
+	end
+
+	return nil, "No supported HTTP method available or fetch failed"
+end
+
+-- Utility: human size
+local function humanSize(n)
+	if not n then return "0 B" end
+	if n > 1024*1024 then return string.format("%.2f MB", n / (1024*1024)) end
+	if n > 1024 then return string.format("%.2f KB", n / 1024) end
+	return tostring(n) .. " B"
+end
+
+-- Obfuscation encoding:
+-- For each byte produce token: r/NUM/OFF  where NUM = byte * multiplier + offset
+-- We will join tokens with "/" then split into safe parts and create many local var lines.
+local function encodeToTokens(str, multiplier)
+	multiplier = multiplier or 19
+	local t = {}
+	for i = 1, #str do
+		local b = string.byte(str, i)
+		local r = math.random(0, 9)
+		local off = math.random(0, 9)
+		local num = b * multiplier + off
+		-- token format: r/NUM/OFF
+		t[#t + 1] = tostring(r) .. "/" .. tostring(num) .. "/" .. tostring(off)
+	end
+	return table.concat(t, "/")
+end
+
+-- Split token string into parts of approx partLen chars
+local function splitIntoParts(s, partLen)
+	partLen = partLen or 4096
+	local parts = {}
+	local pos = 1
+	local len = #s
+	while pos <= len do
+		local take = math.min(partLen, len - pos + 1)
+		parts[#parts + 1] = s:sub(pos, pos + take - 1)
+		pos = pos + take
+	end
+	return parts
+end
+
+-- Build wrapper string (Lua). Embeds multiplier and decoder.
+local function buildWrapper(originalCode, multiplier)
+	multiplier = multiplier or (17 + math.random(0, 12)) -- 17..29
+	local tokenStr = encodeToTokens(originalCode, multiplier)
+	local parts = splitIntoParts(tokenStr, 3500) -- smaller parts make more lines
+	local lines = {}
+	-- prefix comment (user wanted "Obsfucated" spelling earlier)
+	lines[#lines + 1] = "-- [Obsfucated by RMPG Obsfucator]"
+	lines[#lines + 1] = "-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S")
+	lines[#lines + 1] = ""
+	-- create local variables for each part
+	for i = 1, #parts do
+		local safe = parts[i]:gsub("\\", "\\\\"):gsub('"', '\\"')
+		lines[#lines + 1] = ("local __p%d = \"%s\""):format(i, safe)
+	end
+	lines[#lines + 1] = ""
+	-- assemble
+	lines[#lines + 1] = "local __enc = table.concat({"
+	for i = 1, #parts do
+		lines[#lines + 1] = ("    __p%d,"):format(i)
+	end
+	lines[#lines + 1] = "}, \"\")"
+	lines[#lines + 1] = ""
+	-- decoder uses embedded multiplier
+	lines[#lines + 1] = ("local __mult = %d"):format(multiplier)
+	lines[#lines + 1] = [[
+local function __decode_tokens(s)
+	local out = {}
+	for r, num, offs in string.gmatch(s, "(%d)/(%d+)/(%d+)") do
+		local n = tonumber(num)
+		local off = tonumber(offs) or 0
+		local b = math.floor((n - off) / __mult)
+		out[#out + 1] = string.char(b)
+	end
+	return table.concat(out)
+end
+]]
+	-- execute safely
+	lines[#lines + 1] = [[
+local ok, err = pcall(function()
+	local decoded = __decode_tokens(__enc)
+	local loader = loadstring or load
+	local f = loader(decoded)
+	if type(f) == "function" then f() end
+end)
+if not ok then
+	pcall(function() print("RMPG wrapper error: "..tostring(err)) end)
+end
+]]
+	-- trailing filler comments to increase lines if desired
+	for i = 1, 6 do lines[#lines + 1] = ("-- end marker %d"):format(i) end
+
+	return table.concat(lines, "\n")
+end
+
+-- UI creation (simple, draggable)
+local function createUI()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "RMPG_Obfuscator_UI"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = parentGui
+
+	local main = Instance.new("Frame", screenGui)
+	main.Size = UDim2.new(0, 720, 0, 520)
+	main.Position = UDim2.new(0.5, -360, 0.5, -260)
+	main.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Draggable = true
+
+	local title = Instance.new("TextLabel", main)
+	title.Size = UDim2.new(1, 0, 0, 40)
+	title.Position = UDim2.new(0, 0, 0, 0)
+	title.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 20
+	title.Text = "RMPG Obsfucator (Roblox UI) — RawLink or Paste"
+
+	-- URL input
+	local urlLabel = Instance.new("TextLabel", main)
+	urlLabel.Size = UDim2.new(0, 120, 0, 20)
+	urlLabel.Position = UDim2.new(0, 10, 0, 50)
+	urlLabel.BackgroundTransparency = 1
+	urlLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+	urlLabel.Font = Enum.Font.Code
+	urlLabel.TextSize = 14
+	urlLabel.Text = "Raw URL (optional):"
+
+	local urlBox = Instance.new("TextBox", main)
+	urlBox.Size = UDim2.new(0, 600, 0, 28)
+	urlBox.Position = UDim2.new(0, 140, 0, 48)
+	urlBox.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+	urlBox.TextColor3 = Color3.fromRGB(230, 230, 230)
+	urlBox.Font = Enum.Font.Code
+	urlBox.TextSize = 14
+	urlBox.ClearTextOnFocus = false
+	urlBox.PlaceholderText = "https://raw.githubusercontent.com/... or raw paste link..."
+
+	-- Paste input label and scrolling input (unlimited-like)
+	local pasteLabel = Instance.new("TextLabel", main)
+	pasteLabel.Size = UDim2.new(0, 120, 0, 20)
+	pasteLabel.Position = UDim2.new(0, 10, 0, 86)
+	pasteLabel.BackgroundTransparency = 1
+	pasteLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+	pasteLabel.Font = Enum.Font.Code
+	pasteLabel.TextSize = 14
+	pasteLabel.Text = "Or paste script:"
+
+	local pasteScroll = Instance.new("ScrollingFrame", main)
+	pasteScroll.Size = UDim2.new(1, -20, 0, 180)
+	pasteScroll.Position = UDim2.new(0, 10, 0, 108)
+	pasteScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	pasteScroll.BorderSizePixel = 0
+	pasteScroll.ScrollBarThickness = 8
+	pasteScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+	local pasteBox = Instance.new("TextBox", pasteScroll)
+	pasteBox.Size = UDim2.new(1, -20, 0, 3000) -- very tall to support huge pastes without UI limiting
+	pasteBox.Position = UDim2.new(0, 10, 0, 10)
+	pasteBox.BackgroundTransparency = 1
+	pasteBox.TextColor3 = Color3.fromRGB(230, 230, 230)
+	pasteBox.Font = Enum.Font.Code
+	pasteBox.TextSize = 14
+	pasteBox.TextWrapped = false
+	pasteBox.ClearTextOnFocus = false
+	pasteBox.MultiLine = true
+	pasteBox.PlaceholderText = "Paste your Lua script here (or leave empty if using URL)."
+
+	-- Buttons: Fetch+Obfuscate and Copy
+	local obfBtn = Instance.new("TextButton", main)
+	obfBtn.Size = UDim2.new(0, 220, 0, 40)
+	obfBtn.Position = UDim2.new(0, 10, 0, 300)
+	obfBtn.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+	obfBtn.Font = Enum.Font.GothamBold
+	obfBtn.TextSize = 18
+	obfBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	obfBtn.Text = "🔒 Fetch & Obsfucate"
+
+	local copyBtn = Instance.new("TextButton", main)
+	copyBtn.Size = UDim2.new(0, 220, 0, 40)
+	copyBtn.Position = UDim2.new(0, 240, 0, 300)
+	copyBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 140)
+	copyBtn.Font = Enum.Font.GothamBold
+	copyBtn.TextSize = 18
+	copyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	copyBtn.Text = "📋 Copy Obsfucated"
+
+	local previewBtn = Instance.new("TextButton", main)
+	previewBtn.Size = UDim2.new(0, 220, 0, 40)
+	previewBtn.Position = UDim2.new(0, 470, 0, 300)
+	previewBtn.BackgroundColor3 = Color3.fromRGB(140, 140, 140)
+	previewBtn.Font = Enum.Font.GothamBold
+	previewBtn.TextSize = 18
+	previewBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	previewBtn.Text = "🔎 Preview Source"
+
+	-- Result area (scrollable)
+	local resultLabel = Instance.new("TextLabel", main)
+	resultLabel.Size = UDim2.new(1, -20, 0, 20)
+	resultLabel.Position = UDim2.new(0, 10, 0, 350)
+	resultLabel.BackgroundTransparency = 1
+	resultLabel.Font = Enum.Font.Code
+	resultLabel.TextSize = 14
+	resultLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+	resultLabel.Text = "Result (obfuscated wrapper shown below):"
+
+	local resultScroll = Instance.new("ScrollingFrame", main)
+	resultScroll.Size = UDim2.new(1, -20, 0, 150)
+	resultScroll.Position = UDim2.new(0, 10, 0, 374)
+	resultScroll.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+	resultScroll.BorderSizePixel = 0
+	resultScroll.ScrollBarThickness = 8
+	resultScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+	local resultBox = Instance.new("TextLabel", resultScroll)
+	resultBox.Size = UDim2.new(1, -20, 0, 1200)
+	resultBox.Position = UDim2.new(0, 10, 0, 10)
+	resultBox.BackgroundTransparency = 1
+	resultBox.Font = Enum.Font.Code
+	resultBox.TextSize = 14
+	resultBox.TextWrapped = false
+	resultBox.TextXAlignment = Enum.TextXAlignment.Left
+	resultBox.TextYAlignment = Enum.TextYAlignment.Top
+	resultBox.TextColor3 = Color3.fromRGB(120, 255, 150)
+	resultBox.RichText = false
+	resultBox.Text = "(No obfuscated output yet.)"
+
+	local status = Instance.new("TextLabel", main)
+	status.Size = UDim2.new(1, -20, 0, 18)
+	status.Position = UDim2.new(0, 10, 0, 530)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.Code
+	status.TextSize = 13
+	status.TextColor3 = Color3.fromRGB(200, 200, 200)
+	status.Text = "Ready — paste or provide URL."
+
+	-- internal storage
+	local lastWrapped = nil
+	local lastSourceName = nil
+	local lastSourceSize = 0
+
+	-- safe random seed
+	math.randomseed(tick() % 2147483647)
+	for i = 1, 5 do math.random() end
+
+	-- helper to set result and resize scroll
+	local function showResultText(txt)
+		-- prefix comment line ensured inside wrapper; but ensure displayed label starts with comment
+		resultBox.Text = txt
+		local newlines = select(2, txt:gsub("\n", "\n"))
+		local linesCount = math.max(1, newlines + 1)
+		local lineHeight = 16
+		local desired = math.clamp(linesCount * lineHeight + 20, 120, 100000)
+		resultBox.Size = UDim2.new(1, -20, 0, desired)
+		resultScroll.CanvasSize = UDim2.new(0, 0, 0, desired + 20)
+	end
+
+	-- Preview handler
+	previewBtn.MouseButton1Click:Connect(function()
+		local url = tostring(urlBox.Text or ""):match("^%s*(.-)%s*$")
+		local paste = tostring(pasteBox.Text or "")
+		if url ~= "" then
+			status.Text = "Fetching preview from URL..."
+			local body, err = tryFetch(url)
+			if not body then
+				status.Text = "Fetch failed: " .. tostring(err)
+				return
+			end
+			local head = body:sub(1, 1024)
+			status.Text = ("Fetched %s bytes. Showing head..."):format(#body)
+			showResultText(("--- Preview of fetched content (first 1KB) ---\n%s\n\n(Use Fetch & Obsfucate to process full content.)"):format(head))
+			return
+		end
+		if paste == "" then
+			status.Text = "No URL or paste content to preview."
+			return
+		end
+		local head = paste:sub(1, 1024)
+		status.Text = ("Previewing pasted content: %d chars (showing 1KB)"):format(#paste)
+		showResultText(("--- Preview of pasted content (first 1KB) ---\n%s\n\n(Use Fetch & Obsfucate to obfuscate.)"):format(head))
+	end)
+
+	-- main obfuscate handler
+	obfBtn.MouseButton1Click:Connect(function()
+		status.Text = "Starting fetch/obfuscation..."
+		local url = tostring(urlBox.Text or ""):match("^%s*(.-)%s*$")
+		local paste = tostring(pasteBox.Text or "")
+		local src = nil
+		local srcName = "inline_paste"
+		-- if URL provided, attempt fetch
+		if url ~= "" then
+			status.Text = "Fetching raw link..."
+			local body, err = tryFetch(url)
+			if not body then
+				status.Text = "Fetch failed: " .. tostring(err)
+				return
+			end
+			src = body
+			srcName = url
+			lastSourceSize = #body
+			status.Text = ("Fetched %s (%s). Building obfuscated wrapper..."):format(humanSize(#body), srcName)
+		else
+			if paste == "" then
+				status.Text = "No URL or paste content provided."
+				return
+			end
+			src = paste
+			srcName = "pasted_input"
+			lastSourceSize = #src
+			status.Text = ("Using pasted input (%s). Building obfuscated wrapper..."):format(humanSize(#src))
+		end
+
+		-- build wrapper (may be large)
+		-- choose multiplier
+		local multiplier = 17 + math.random(0, 12)
+		local ok, wrapper = pcall(function() return buildWrapper(src, multiplier) end)
+		if not ok or type(wrapper) ~= "string" then
+			status.Text = "Failed to build wrapper (memory/processing error). Try smaller input or append in parts."
+			return
+		end
+
+		-- store and show preview only (avoid putting overly huge text into UI if extremely big)
+		lastWrapped = wrapper
+		lastSourceName = srcName
+
+		-- show first N chars then note size; full content is available for copy
+		local showN = 6000
+		local preview = wrapper:sub(1, showN)
+		if #wrapper > showN then
+			preview = preview .. ("\n\n-- (output truncated in UI; total size %s. Use Copy to copy full wrapper) --"):format(humanSize(#wrapper))
+		end
+		showResultText(preview)
+		status.Text = ("Obfuscation complete. Multiplier=%d | Obfuscated size: %s | Use Copy to copy full wrapper."):format(multiplier, humanSize(#wrapper))
+	end)
+
+	-- copy handler: attempts setclipboard, falls back to putting text fully in label (may be slow if huge)
+	copyBtn.MouseButton1Click:Connect(function()
+		if not lastWrapped then
+			status.Text = "Nothing to copy. Obfuscate first."
+			return
+		end
+		-- try setclipboard
+		local ok = pcall(function() setclipboard(lastWrapped) end)
+		if ok then
+			status.Text = "✅ Full obfuscated wrapper copied to clipboard (if your executor allows)."
+			return
+		end
+		-- fallback: attempt to paste the full text into resultBox (careful: may be huge)
+		status.Text = "Clipboard denied — writing full wrapper into UI (may be slow)..."
+		showResultText(lastWrapped)
+		status.Text = "Full wrapper written to UI. Manually copy or use executor's file-save feature."
+	end)
+
+	return screenGui
+end
+
+-- Create UI
+local gui = createUI()
+
+-- Done
+print("RMPG Obsfucator UI loaded. Use the GUI to fetch a raw link or paste a script, then press 'Fetch & Obsfucate'.")
